@@ -50,7 +50,7 @@ Aquí es donde tu payload cobra vida.
 🟢 Fase 5: La Conexión (El Shellcode en acción)
 El shellcode que generaste con msfvenom -p windows/shell_reverse_tcp se ejecuta.
 
-Lo primero que hace es crear un Socket TCP y conectarse a la IP y puerto que le indicaste (192.168.0.2:4444).
+Lo primero que hace es crear un Socket TCP y conectarse a la IP y puerto que le indicaste (192.168.234.2:4444).
 
 Como usaste un payload Stageless (sin etapas), no pide nada más. Inmediatamente lanza un proceso cmd.exe en Windows.
 
