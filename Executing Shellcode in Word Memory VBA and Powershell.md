@@ -708,3 +708,7 @@ Exercises
 
 
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/b8157dca-5205-4fa5-8f8b-63841a403743" />
+
+with macro
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/5741c45d-0051-41a9-8298-6b087174d45c" />
+
