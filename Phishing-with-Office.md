@@ -273,6 +273,10 @@ So, step by step after creating and saving RSA document
 
 
 
+## MoTW
+<img width="551" height="764" alt="image" src="https://github.com/user-attachments/assets/18c4007a-96eb-4eb7-a50b-acc479f9c856" />
+If we check Unblock and click Apply, the MoTW attribute is unset and the Word document would be treated as a locally-created file. This disables Protected View and allows macros to run.
 
-
+This requires attackers to provide a convincing pretext to trick the user into unblocking the document and remove the Mark of the Web before opening the document.
+[Mark of the Web remover](https://github.com/CtrlAltDarren/MotW-Remover#1)
 
